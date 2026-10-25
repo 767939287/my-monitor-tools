@@ -40,7 +40,11 @@ jobs:
           bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
           chat_id = os.getenv("TELEGRAM_CHAT_ID")
           mail_server = os.getenv("MAIL_SERVER")
-          mail_port = int(os.getenv("MAIL_PORT", 465))
+          
+          # 修复：安全解析 MAIL_PORT，防止空字符串导致 int() 报错
+          mail_port_env = os.getenv("MAIL_PORT")
+          mail_port = int(mail_port_env) if mail_port_env and mail_port_env.strip() else 465
+
           mail_user = os.getenv("MAIL_USERNAME")
           mail_pass = os.getenv("MAIL_PASSWORD")
           mail_to = os.getenv("MAIL_TO")
@@ -108,8 +112,8 @@ jobs:
                   except Exception as ex:
                       print(f"Telegram 发送失败: {ex}")
 
-              # 发送电子邮件
-              if all([mail_server, mail_user, mail_pass, mail_to]):
+              # 发送电子邮件（只有当完整配置了邮件相关参数时才尝试发送）
+              if all([mail_server, mail_user, mail_pass, mail_to]) and mail_server.strip():
                   try:
                       msg = MIMEText(html_content, 'html', 'utf-8')
                       msg['From'] = Header(f"Monitor Bot <{mail_user}>", 'utf-8')
@@ -123,6 +127,8 @@ jobs:
                       print("邮件告警发送成功。")
                   except Exception as ex:
                       print(f"邮件发送失败: {ex}")
+              else:
+                  print("邮件配置不完整或未启用，已跳过邮件发送。")
               
               exit(1) # 使 Action 标记为失败，方便后台追踪
           else:
