@@ -2,8 +2,12 @@ name: Telegram DC & GitHub Dual-Channel Monitor
 
 on:
   schedule:
-    - cron: '*/30 * * * *'  # 每 30 分钟自动检查一次
+    # 每 30 分钟一次；官方文档说明整点/半点属高负载时段可能延迟甚至丢弃排队任务，故错峰到 7/37 分
+    - cron: '7,37 * * * *'
   workflow_dispatch:      # 支持在 Actions 页面手动点击触发测试
+
+permissions:
+  contents: read
 
 jobs:
   Dual-monitor:
@@ -15,39 +19,23 @@ jobs:
           python-version: '3.10'
 
       - name: Install Dependencies
-        run: pip install requests
+        run: python -m pip install --quiet requests
 
       - name: Run Dual-Channel Monitor and Alert
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          MAIL_SERVER: ${{ secrets.MAIL_SERVER }}
-          MAIL_PORT: ${{ secrets.MAIL_PORT }}
-          MAIL_USERNAME: ${{ secrets.MAIL_USERNAME }}
-          MAIL_PASSWORD: ${{ secrets.MAIL_PASSWORD }}
-          MAIL_TO: ${{ secrets.MAIL_TO }}
         run: |
           python - <<'EOF'
           import os
           import socket
           import time
           import requests
-          import smtplib
-          from email.header import Header
-          from email.mime.text import MIMEText
+          from html import escape as html_escape
 
-          # 读取环境变量
+          # 读取环境变量（只走 Telegram 通道）
           bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
           chat_id = os.getenv("TELEGRAM_CHAT_ID")
-          mail_server = os.getenv("MAIL_SERVER")
-          
-          # 修复：安全解析 MAIL_PORT，防止空字符串导致 int() 报错
-          mail_port_env = os.getenv("MAIL_PORT")
-          mail_port = int(mail_port_env) if mail_port_env and mail_port_env.strip() else 465
-
-          mail_user = os.getenv("MAIL_USERNAME")
-          mail_pass = os.getenv("MAIL_PASSWORD")
-          mail_to = os.getenv("MAIL_TO")
 
           issues = []
           report_lines = []
@@ -61,77 +49,131 @@ jobs:
               "DC5 (Singapore)": ("91.108.56.130", 443)
           }
 
+          def probe(host, port, attempts=2, timeout=5, gap=1):
+              """单次丢包不算故障：连续 attempts 次都失败才判定异常。"""
+              last_error = ""
+              for i in range(attempts):
+                  start_time = time.time()
+                  try:
+                      sock = socket.create_connection((host, port), timeout=timeout)
+                      sock.close()
+                      return round((time.time() - start_time) * 1000), None
+                  except Exception as ex:
+                      last_error = str(ex)
+                      if i < attempts - 1:
+                          time.sleep(gap)
+              return None, last_error
+
           report_lines.append("<b>【Telegram 5 DCs Status】</b>")
           for dc_name, (host, port) in dcs.items():
-              start_time = time.time()
-              try:
-                  sock = socket.create_connection((host, port), timeout=5)
-                  sock.close()
-                  latency = round((time.time() - start_time) * 1000)
-                  report_lines.append(f"• {dc_name}: 🟢 正常 ({latency}ms)")
-              except Exception:
+              latency, err = probe(host, port)
+              if latency is None:
                   issues.append(f"Telegram {dc_name} 连接失败")
-                  report_lines.append(f"• {dc_name}: ❌ 连接超时/失败")
+                  report_lines.append(f"• {dc_name}: ❌ 连续 2 次连接失败 ({html_escape(err)})")
+              else:
+                  report_lines.append(f"• {dc_name}: 🟢 正常 ({latency}ms)")
 
           # 2. 检查 GitHub 官方状态
           report_lines.append("<br><b>【GitHub Status】</b>")
           try:
               res = requests.get("https://www.githubstatus.com/api/v2/summary.json", timeout=10)
+              res.raise_for_status()
               data = res.json()
               indicator = data.get("status", {}).get("indicator", "none")
               description = data.get("status", {}).get("description", "All Systems Operational")
-              
+
               if indicator == "none":
-                  report_lines.append(f"• 全局状态: 🟢 正常 ({description})")
+                  report_lines.append(f"• 全局状态: 🟢 正常 ({html_escape(str(description))})")
               else:
                   issues.append(f"GitHub 全局异常: {description}")
-                  report_lines.append(f"• 全局状态: 🔴 异常 ({description})")
-                  
+                  report_lines.append(f"• 全局状态: 🔴 异常 ({html_escape(str(description))})")
+
                   for comp in data.get("components", []):
                       if comp.get("status") != "operational":
-                          report_lines.append(f"  - 故障组件: {comp.get('name')} ({comp.get('status')})")
+                          report_lines.append(f"  - 故障组件: {html_escape(str(comp.get('name')))} ({comp.get('status')})")
           except Exception as e:
               issues.append(f"无法请求 GitHub Status API: {e}")
-              report_lines.append(f"• GitHub 状态检查接口请求失败: {e}")
+              report_lines.append(f"• GitHub 状态检查接口请求失败: {html_escape(str(e))}")
 
-          # 如果有异常，则双通道推送告警
-          if issues:
-              subject = "🚨 【系统告警】Telegram DC 或 GitHub 服务出现异常！"
-              html_content = f"<h3>⚠️ 检测到以下基础设施故障：</h3>" + "<br>".join(report_lines) + f"<br><br><hr><small>Triggered by GitHub Actions Auto-Monitor</small>"
-              
-              # 发送 Telegram 消息
-              if bot_token and chat_id:
-                  tg_text = "🚨 **基础设施异常告警！**\n\n" + "\n".join(report_lines).replace("<b>", "").replace("</b>", "").replace("<br>", "\n")
+          # 3. Telegram 通道探活：DC 通不通不代表 Bot API 可用，以 getMe 结果为准
+          def bot_api_check(token, attempts=2, timeout=10, gap=2):
+              if not token:
+                  return None, "未配置 TELEGRAM_BOT_TOKEN"
+              url = f"https://api.telegram.org/bot{token}/getMe"
+              last_error = ""
+              for i in range(attempts):
                   try:
-                      requests.post(
-                          f"https://api.telegram.org/bot{bot_token}/sendMessage",
-                          json={"chat_id": chat_id, "text": tg_text, "parse_mode": "Markdown", "disable_web_page_preview": True},
-                          timeout=10
-                      )
-                      print("Telegram 告警发送成功。")
+                      resp = requests.get(url, timeout=timeout)
+                      try:
+                          payload = resp.json()
+                      except Exception:
+                          payload = {}
+                      if resp.status_code == 200 and payload.get("ok"):
+                          return True, (payload.get("result") or {}).get("username", "")
+                      last_error = f"HTTP {resp.status_code}: {resp.text[:200]}"
                   except Exception as ex:
-                      print(f"Telegram 发送失败: {ex}")
+                      last_error = str(ex)
+                  print(f"getMe 第 {i + 1}/{attempts} 次失败: {last_error}")
+                  if i < attempts - 1:
+                      time.sleep(gap)
+              return False, last_error
 
-              # 发送电子邮件（只有当完整配置了邮件相关参数时才尝试发送）
-              if all([mail_server, mail_user, mail_pass, mail_to]) and mail_server.strip():
-                  try:
-                      msg = MIMEText(html_content, 'html', 'utf-8')
-                      msg['From'] = Header(f"Monitor Bot <{mail_user}>", 'utf-8')
-                      msg['To'] = Header(mail_to, 'utf-8')
-                      msg['Subject'] = Header(subject, 'utf-8')
+          channel_ok, channel_detail = bot_api_check(bot_token)
+          if channel_ok is not True:
+              issues.append("Telegram Bot API 不可用")
+              report_lines.append(f"• <b>Telegram Bot API</b>: 🔴 不可用 ({html_escape(str(channel_detail))})")
 
-                      server = smtplib.SMTP_SSL(mail_server, mail_port)
-                      server.login(mail_user, mail_pass)
-                      server.sendmail(mail_user, [mail_to], msg.as_string())
-                      server.quit()
-                      print("邮件告警发送成功。")
-                  except Exception as ex:
-                      print(f"邮件发送失败: {ex}")
-              else:
-                  print("邮件配置不完整或未启用，已跳过邮件发送。")
-              
-              exit(1) # 使 Action 标记为失败，方便后台追踪
-          else:
+          # 4. 判定与退出码
+          #    0 = 全部正常，或告警已成功送达 Telegram（不触发 GitHub 失败邮件）
+          #    1 = 告警未送达 / Telegram 通道故障（Action 标红 -> GitHub 自动发邮件兜底）
+          if not issues:
               print("所有监控目标运行正常，无需告警：")
               print("\n".join(report_lines))
+              exit(0)
+
+          tg_text = "🚨 <b>基础设施异常告警！</b>\n\n" + "\n".join(report_lines).replace("<br>", "\n")
+          if len(tg_text) > 4000:  # Telegram sendMessage 的 text 上限为 4096 字符
+              tg_text = tg_text[:4000] + "\n…（内容过长已截断）"
+
+          if not (bot_token and chat_id):
+              print("::error title=Telegram 配置缺失::未配置 TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID，告警无法送达")
+              print("\n".join(report_lines))
+              exit(1)
+
+          sent = False
+          last_error = ""
+          for attempt in range(1, 4):
+              try:
+                  resp = requests.post(
+                      f"https://api.telegram.org/bot{bot_token}/sendMessage",
+                      json={
+                          "chat_id": chat_id,
+                          "text": tg_text,
+                          "parse_mode": "HTML",
+                          "link_preview_options": {"is_disabled": True},
+                      },
+                      timeout=15,
+                  )
+                  try:
+                      payload = resp.json()
+                  except Exception:
+                      payload = {}
+                  if resp.status_code == 200 and payload.get("ok"):
+                      sent = True
+                      break
+                  last_error = f"HTTP {resp.status_code}: {resp.text[:300]}"
+              except Exception as ex:
+                  last_error = str(ex)
+              print(f"Telegram 第 {attempt} 次发送失败: {last_error}")
+              if attempt < 3:
+                  time.sleep(3)
+
+          if sent:
+              print("Telegram 告警发送成功。")
+              print("::warning title=已发送 Telegram 告警::异常详情已在 Telegram 送达，本次不触发失败邮件")
+              exit(0)
+
+          print(f"::error title=Telegram 告警未能送达::{last_error}")
+          print("\n".join(report_lines))
+          exit(1)
           EOF
